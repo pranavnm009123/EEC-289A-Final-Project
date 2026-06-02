@@ -1,0 +1,1910 @@
+================================================================================
+  EEC 289A — SENSORIMOTOR LEARNING
+  FINAL PROJECT: MODEL-FREE VS MODEL-BASED RL ON SPARSE-REWARD NAVIGATION
+  FULL ENGINEERING IMPLEMENTATION PLAN — EXTREME DETAIL
+  Team: Pranav Manimaran, Vandana Mansur
+================================================================================
+
+
+================================================================================
+SECTION 1: PROJECT FILE LAYOUT
+================================================================================
+
+Full directory tree. Every file listed with its exact purpose.
+
+EEC-289A-Final-Project/
+│
+├── README.md                          # Setup, usage, results summary
+├── requirements.txt                   # All pip deps, pinned versions
+├── plan.txt                           # This document
+├── .gitignore
+│
+├── configs/                           # YAML hyperparameter files
+│   ├── ppo_empty.yaml                 # PPO on Empty-8x8
+│   ├── ppo_doorkey.yaml               # PPO on DoorKey-8x8
+│   ├── ppo_multiroom.yaml             # PPO on MultiRoom-N4-S5
+│   ├── ppo_keycorridor.yaml           # PPO on KeyCorridor-S3-R1
+│   ├── dynaq_empty.yaml
+│   ├── dynaq_doorkey.yaml
+│   ├── dynaq_multiroom.yaml
+│   ├── dynaq_keycorridor.yaml
+│   ├── worldmodel_empty.yaml
+│   ├── worldmodel_doorkey.yaml
+│   ├── worldmodel_multiroom.yaml
+│   └── worldmodel_keycorridor.yaml
+│
+├── envs/
+│   ├── __init__.py                    # exports make_env, ENVS dict
+│   ├── wrappers.py                    # All gymnasium wrappers
+│   └── utils.py                       # make_env factory, env name map
+│
+├── models/
+│   ├── __init__.py
+│   ├── cnn_encoder.py                 # Shared CNN obs encoder
+│   ├── mlp.py                         # Configurable MLP block
+│   ├── transition_model.py            # Dyna-Q (s,a) -> (s',r) model
+│   └── rssm.py                        # Recurrent State Space Model
+│
+├── agents/
+│   ├── __init__.py                    # exports get_agent(name)
+│   ├── base.py                        # Abstract Agent base class
+│   ├── ppo/
+│   │   ├── __init__.py
+│   │   ├── agent.py                   # PPOAgent: train(), act(), save(), load()
+│   │   ├── network.py                 # ActorCritic nn.Module
+│   │   └── rollout_buffer.py          # GAE computation, minibatch sampling
+│   ├── dynaq/
+│   │   ├── __init__.py
+│   │   ├── agent.py                   # DynaQAgent: train(), act(), save(), load()
+│   │   ├── network.py                 # DQN-style Q-network
+│   │   └── replay_buffer.py           # Circular replay buffer
+│   └── worldmodel/
+│       ├── __init__.py
+│       ├── agent.py                   # WorldModelAgent: train(), act(), save(), load()
+│       ├── world_model.py             # Full RSSM world model
+│       ├── actor_critic.py            # Latent-space actor + critic
+│       └── replay_buffer.py           # Sequence-based replay buffer
+│
+├── train.py                           # CLI entry point for training
+├── evaluate.py                        # Evaluation, generalization, metric export
+├── visualize.py                       # All figure and GIF generation
+├── run_experiments.sh                 # Launch all 36 training runs sequentially
+├── run_experiments_parallel.sh        # GPU parallel version using tmux/screen
+│
+├── results/
+│   ├── checkpoints/                   # Saved model weights (.pt)
+│   │   └── {agent}_{env}_seed{N}_step{K}.pt
+│   ├── logs/                          # Per-run CSV training logs
+│   │   └── {agent}_{env}_seed{N}.csv
+│   ├── plots/                         # All PNG figures
+│   ├── gifs/                          # Agent behavior GIFs
+│   └── tables/                        # Aggregated result CSVs
+│       ├── main_results.csv
+│       ├── generalization_results.csv
+│       ├── ablation_planning_ratio.csv
+│       ├── ablation_horizon.csv
+│       └── wallclock_results.csv
+│
+└── notebooks/
+    ├── analysis.ipynb                 # Interactive results exploration
+    ├── failure_cases.ipynb            # Failure mode deep-dive
+    └── model_inspection.ipynb        # World model internals inspection
+
+
+================================================================================
+SECTION 2: ENVIRONMENT SETUP AND PREPROCESSING
+================================================================================
+
+------------------------------------------------------------------------
+2.1 Dependencies
+------------------------------------------------------------------------
+
+requirements.txt (exact versions):
+
+  minigrid==2.3.1
+  gymnasium==0.29.1
+  torch==2.2.1
+  torchvision==0.17.1
+  numpy==1.26.4
+  matplotlib==3.8.4
+  seaborn==0.13.2
+  imageio==2.34.1
+  imageio[ffmpeg]
+  Pillow==10.3.0
+  pyyaml==6.0.1
+  tqdm==4.66.2
+  stable-baselines3==2.3.2
+  scipy==1.13.0
+  pandas==2.2.2
+  wandb==0.16.6               # optional, can replace with CSV logging
+
+Installation:
+  python3 -m venv venv
+  source venv/bin/activate     # Windows: venv\Scripts\activate
+  pip install -r requirements.txt
+
+Python version: 3.10+ required (uses match statements in config loading)
+
+------------------------------------------------------------------------
+2.2 Environment Names and Properties
+------------------------------------------------------------------------
+
+ENV_MAP = {
+  "empty":       "MiniGrid-Empty-8x8-v0",
+  "doorkey":     "MiniGrid-DoorKey-8x8-v0",
+  "multiroom":   "MiniGrid-MultiRoom-N4-S5-v0",
+  "keycorridor": "MiniGrid-KeyCorridor-S3-R1-v0",
+}
+
+Properties of each env:
+  Empty-8x8:
+    - Grid: 8x8, agent starts random position, goal fixed bottom-right
+    - Observation: 7x7 partial view (3 channels: object, color, state)
+    - Max steps: 8*8*2 = 128 per episode
+    - Optimal policy: ~8-12 steps
+    - Challenge: baseline only, should be solved quickly by all agents
+    - Reward: +1 - 0.9*(steps/max_steps) at goal, 0 otherwise
+
+  DoorKey-8x8:
+    - Grid: 8x8, key and locked door randomly placed
+    - Requires: pick up key (toggle), navigate to door, unlock (toggle), reach goal
+    - Max steps: 300
+    - Optimal policy: ~15-25 steps depending on key/door placement
+    - Challenge: two-stage task, requires temporal credit assignment
+    - Reward: sparse +1 at goal only
+
+  MultiRoom-N4-S5:
+    - 4 rooms of size 5x5 connected by doors (unlocked)
+    - Agent must find path through all rooms to goal in final room
+    - Max steps: 250
+    - Optimal policy: ~30-50 steps
+    - Challenge: long credit assignment chain, many rooms
+
+  KeyCorridor-S3-R1:
+    - Corridor layout, 1 row of rooms, key behind locked door
+    - Most complex: longest horizon, multiple doors
+    - Max steps: 200
+    - Optimal policy: ~40-60 steps
+    - Challenge: requires systematic search and long-horizon planning
+
+------------------------------------------------------------------------
+2.3 Observation Preprocessing (envs/wrappers.py)
+------------------------------------------------------------------------
+
+Raw MiniGrid observation: dict with "image" key, shape (7, 7, 3)
+  Channel 0: object type (0-10, encoded as int)
+  Channel 1: color (0-5, encoded as int)
+  Channel 2: state (0-2: open/closed/locked for doors)
+
+Preprocessing pipeline (applied in order):
+
+  Step 1 — FullyObsWrapper (optional, configurable):
+    Replaces partial 7x7 view with full grid view
+    Shape becomes (H, W, 3) where H, W = grid height/width
+    Use fully_obs=True for our experiments (cleaner comparison)
+    Run partially_obs ablation separately for section 6
+
+  Step 2 — ImgObsWrapper:
+    Extracts just the "image" array from obs dict
+    Shape: (H, W, 3) uint8
+
+  Step 3 — Custom NormalizeObsWrapper:
+    Transpose (H, W, 3) -> (3, H, W)
+    Normalize each channel independently:
+      Channel 0 (object):  divide by 10.0
+      Channel 1 (color):   divide by 5.0
+      Channel 2 (state):   divide by 2.0
+    All values now in [0, 1] float32
+    Final shape: (3, 8, 8) for 8x8 envs
+
+  Step 4 — TimeLimit wrapper:
+    Enforce max_steps per episode (from env config)
+    Needed because some envs don't terminate on timeout by default
+
+  Step 5 — RecordEpisodeStatistics wrapper:
+    Automatically tracks episode return and length
+    Adds info["episode"] = {"r": return, "l": length, "t": time} on done
+
+Full wrapper stack (envs/utils.py):
+
+  def make_env(env_key, seed, fully_obs=True, max_steps=None, record=True):
+      env_id = ENV_MAP[env_key]
+      env = gymnasium.make(env_id)
+      if fully_obs:
+          env = FullyObsWrapper(env)
+      env = ImgObsWrapper(env)
+      env = NormalizeObsWrapper(env)
+      if max_steps is not None:
+          env = TimeLimit(env, max_episode_steps=max_steps)
+      if record:
+          env = RecordEpisodeStatistics(env)
+      env.reset(seed=seed)
+      env.action_space.seed(seed)
+      return env
+
+Action space: Discrete(7)
+  0: turn left
+  1: turn right
+  2: move forward
+  3: pick up object
+  4: drop object
+  5: toggle (open door/interact)
+  6: done (unused — we mask this)
+  Effective action space: 6 (mask action 6)
+
+------------------------------------------------------------------------
+2.4 Seeding and Reproducibility
+------------------------------------------------------------------------
+
+Seeding strategy — must set ALL of the following:
+  import random, numpy as np, torch
+  random.seed(seed)
+  np.random.seed(seed)
+  torch.manual_seed(seed)
+  torch.cuda.manual_seed_all(seed)
+  torch.backends.cudnn.deterministic = True
+  torch.backends.cudnn.benchmark = False
+  env.reset(seed=seed)
+  env.action_space.seed(seed)
+
+3 seeds per (agent, env): [42, 123, 777]
+Total runs: 3 agents x 4 envs x 3 seeds = 36 training runs
+
+To verify reproducibility:
+  Run seed=42 twice for PPO on Empty
+  Load both CSVs, assert success_rate columns are identical
+
+
+================================================================================
+SECTION 3: NEURAL NETWORK ARCHITECTURES
+================================================================================
+
+------------------------------------------------------------------------
+3.1 Shared CNN Encoder (models/cnn_encoder.py)
+------------------------------------------------------------------------
+
+Input: (B, 3, 8, 8) — batch of preprocessed observations
+
+Architecture:
+  Conv2d(in=3,  out=32, kernel=3, stride=1, padding=1) -> BatchNorm2d(32) -> ReLU
+  Conv2d(in=32, out=64, kernel=3, stride=1, padding=1) -> BatchNorm2d(64) -> ReLU
+  Conv2d(in=64, out=64, kernel=3, stride=1, padding=1) -> BatchNorm2d(64) -> ReLU
+  Flatten()   -> shape (B, 64*8*8) = (B, 4096)
+  Linear(4096, 256) -> ReLU
+  Output: (B, 256)
+
+Notes:
+  - No pooling layers: 8x8 grid is already small, pooling loses spatial info
+  - BatchNorm helps training stability especially for world model
+  - 256-dim latent is shared dimension across all agents for fair comparison
+  - Weight init: orthogonal init with gain=sqrt(2) for conv, gain=0.01 for output layers
+
+Parameter count: ~330K params (small, intentional — MiniGrid is simple)
+
+------------------------------------------------------------------------
+3.2 PPO Actor-Critic Network (agents/ppo/network.py)
+------------------------------------------------------------------------
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_shape, n_actions):
+        self.encoder = CNNEncoder(obs_shape)       # -> 256
+        self.actor   = nn.Linear(256, n_actions)   # policy logits
+        self.critic  = nn.Linear(256, 1)           # state value
+
+    def forward(self, obs):
+        z = self.encoder(obs)                      # (B, 256)
+        logits = self.actor(z)                     # (B, 6)
+        value  = self.critic(z).squeeze(-1)        # (B,)
+        dist   = Categorical(logits=logits)
+        return dist, value
+
+    def get_action(self, obs, deterministic=False):
+        dist, value = self.forward(obs)
+        action = dist.mode if deterministic else dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, log_prob, value
+
+Weight init: orthogonal init throughout
+  conv layers:  gain = sqrt(2)
+  actor output: gain = 0.01   (small init -> near-uniform initial policy)
+  critic output: gain = 1.0
+
+------------------------------------------------------------------------
+3.3 Dyna-Q Q-Network (agents/dynaq/network.py)
+------------------------------------------------------------------------
+
+class QNetwork(nn.Module):
+    def __init__(self, obs_shape, n_actions):
+        self.encoder = CNNEncoder(obs_shape)       # -> 256
+        self.q_head  = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, n_actions)              # Q(s,a) for all actions
+        )
+
+    def forward(self, obs):
+        z = self.encoder(obs)
+        return self.q_head(z)                      # (B, n_actions)
+
+Two instances: online_net, target_net
+  target_net is hard-updated from online_net every 500 steps
+  target_net parameters are frozen (no grad)
+
+Epsilon-greedy action selection:
+  eps = max(eps_end, eps_start - (eps_start - eps_end) * step / eps_decay)
+  if random() < eps: return random action
+  else: return argmax(online_net(obs))
+
+------------------------------------------------------------------------
+3.4 Dyna-Q Transition Model (models/transition_model.py)
+------------------------------------------------------------------------
+
+Learns: f(z_t, a_t) -> (z_{t+1}, r_t)
+
+class TransitionModel(nn.Module):
+    def __init__(self, latent_dim=256, n_actions=6):
+        self.action_embed = nn.Embedding(n_actions, 32)
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + 32, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, latent_dim + 1)    # next_z + reward
+        )
+        self.reward_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, z, action):
+        a_embed = self.action_embed(action)             # (B, 32)
+        x = torch.cat([z, a_embed], dim=-1)             # (B, 288)
+        out = self.net(x)                               # (B, 257)
+        next_z = out[:, :256]                           # (B, 256)
+        reward = out[:, 256] * self.reward_scale        # (B,)
+        return next_z, reward
+
+Training loss:
+  next_z_loss = F.mse_loss(pred_next_z, target_next_z.detach())
+  reward_loss = F.mse_loss(pred_reward, true_reward)
+  total_loss  = next_z_loss + 0.5 * reward_loss
+
+Note: target_next_z is produced by passing real s' through frozen encoder snapshot.
+The encoder is trained separately (as part of Q-network) so we use stop-gradient here.
+
+------------------------------------------------------------------------
+3.5 World Model RSSM (models/rssm.py)
+------------------------------------------------------------------------
+
+The RSSM separates world state into:
+  h_t: deterministic hidden state (GRU memory)     dim=512
+  z_t: stochastic latent state (sample from Normal) dim=32 (32 latent classes x 1)
+
+  NOTE: Use discrete latents (32 categories, 32 classes each = 1024-dim one-hot)
+  following DreamerV3 — more stable than continuous latents for small envs.
+  Simplified for our project: use 1 gaussian with dim=32.
+
+Components:
+
+  1. Sequence Model (GRU):
+     h_t = GRU(h_{t-1}, concat(z_{t-1}, a_{t-1}))
+     GRU hidden dim: 512
+     Input to GRU: concat(32, 32) = 64  [z + action_embed]
+
+  2. Encoder (Posterior):
+     q(z_t | h_t, o_t): given GRU state and current obs
+     Input: concat(h_t, encode(o_t)) = (512 + 256) = 768
+     MLP 768 -> 512 -> ReLU -> 512 -> (mu: 32, log_sigma: 32)
+     z_t ~ Normal(mu, exp(log_sigma))   [reparameterization trick]
+
+  3. Dynamics Predictor (Prior):
+     p(z_t | h_t): predict z from GRU state alone (used during imagination)
+     Input: h_t (512)
+     MLP 512 -> 512 -> ReLU -> (mu: 32, log_sigma: 32)
+     z_t ~ Normal(mu, exp(log_sigma))
+
+  4. Reward Predictor:
+     r_t = f(h_t, z_t)
+     Input: concat(h_t, z_t) = 544
+     MLP 544 -> 400 -> ReLU -> 400 -> ReLU -> 1
+
+  5. Continuation Predictor:
+     c_t = f(h_t, z_t)  — predicts whether episode continues (1) or ends (0)
+     Input: 544
+     MLP 544 -> 400 -> ReLU -> 1 -> Sigmoid
+
+  6. Decoder (for visualization / model quality check):
+     o_hat_t = g(h_t, z_t)
+     Input: 544
+     MLP 544 -> 512 -> ReLU -> 512 -> ReLU -> 3*8*8 (flattened obs)
+     Reshape to (3, 8, 8), apply Sigmoid
+
+  World state = concat(h_t, z_t)   shape: (512 + 32,) = 544-dim
+
+Training losses (per batch of B sequences of length T):
+
+  1. Reconstruction loss (decoder):
+     L_recon = sum_t MSE(decode(h_t, z_t), o_t) / (B*T)
+
+  2. KL divergence (prior vs posterior):
+     L_kl = sum_t max(free_nats, KL(q(z_t|h_t,o_t) || p(z_t|h_t))) / (B*T)
+     free_nats = 1.0   (prevents KL collapse)
+
+  3. Reward prediction:
+     L_reward = sum_t MSE(r_pred_t, r_t) / (B*T)
+
+  4. Continuation prediction:
+     L_cont = sum_t BCE(c_pred_t, done_t) / (B*T)
+
+  Total world model loss:
+     L_wm = L_recon + beta_kl * L_kl + L_reward + L_cont
+     beta_kl = 1.0
+
+  Gradients flow through all components simultaneously.
+  Use single Adam optimizer for entire world model.
+
+------------------------------------------------------------------------
+3.6 World Model Actor-Critic (agents/worldmodel/actor_critic.py)
+------------------------------------------------------------------------
+
+Both actor and critic operate in latent space (544-dim world state).
+They NEVER directly observe the real environment during training.
+
+class LatentActor(nn.Module):
+    Input: world_state (B, 544)
+    MLP: 544 -> 400 -> ELU -> 400 -> ELU -> 400 -> ELU -> n_actions
+    Output: action logits (B, 6) -> Categorical distribution
+
+class LatentCritic(nn.Module):
+    Input: world_state (B, 544)
+    MLP: 544 -> 400 -> ELU -> 400 -> ELU -> 400 -> ELU -> 1
+    Output: scalar value estimate (B,)
+
+Note: use ELU instead of ReLU for smoother gradients through imagination.
+
+Lambda-return computation (in latent space):
+  V_lambda_t = r_t + gamma * [(1-lambda) * V(s_{t+1}) + lambda * V_lambda_{t+1}]
+  lambda = 0.95, gamma = 0.99
+  Computed over imagination horizon H=15
+
+Actor loss:
+  L_actor = -mean(V_lambda.detach() * log_prob(a))   [REINFORCE]
+  + entropy_bonus * mean(entropy)                     [encourage exploration]
+  entropy_bonus = 3e-4
+
+Critic loss:
+  L_critic = mean((V_lambda.detach() - V(s)) ** 2)   [regression to lambda-returns]
+
+Separate optimizers for actor and critic (both Adam, lr=8e-5).
+Gradient clipping: max_norm=100 for actor, max_norm=100 for critic.
+
+
+================================================================================
+SECTION 4: TRAINING ALGORITHMS — STEP BY STEP
+================================================================================
+
+------------------------------------------------------------------------
+4.1 PPO Full Training Loop
+------------------------------------------------------------------------
+
+Pseudocode for train.py --agent ppo:
+
+  Initialize:
+    env = make_env(env_key, seed)
+    net = ActorCritic(obs_shape, n_actions).to(device)
+    optimizer = Adam(net.parameters(), lr=3e-4, eps=1e-5)
+    buffer = RolloutBuffer(n_steps=2048, obs_shape, n_actions)
+    total_steps = 0
+    episode_successes = []
+
+  while total_steps < 500_000:
+
+    # --- Rollout Collection ---
+    obs, _ = env.reset()
+    for step in range(n_steps):   # 2048 steps
+        with torch.no_grad():
+            action, log_prob, value = net.get_action(obs_tensor)
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        buffer.store(obs, action, reward, value, log_prob, done)
+        obs = next_obs
+        total_steps += 1
+        if done:
+            if info.get("success", reward > 0):
+                episode_successes.append(1)
+            else:
+                episode_successes.append(0)
+
+    # Bootstrap value for last obs
+    with torch.no_grad():
+        _, _, last_value = net.get_action(obs_tensor)
+    buffer.compute_gae(last_value, gamma=0.99, gae_lambda=0.95)
+
+    # --- PPO Update ---
+    for epoch in range(10):   # n_epochs
+        for batch in buffer.get_minibatches(batch_size=64):
+            obs_b, act_b, adv_b, ret_b, old_log_b = batch
+
+            # Normalize advantages
+            adv_b = (adv_b - adv_b.mean()) / (adv_b.std() + 1e-8)
+
+            dist, value = net.forward(obs_b)
+            new_log_prob = dist.log_prob(act_b)
+            entropy = dist.entropy().mean()
+
+            # Clipped policy loss
+            ratio = (new_log_prob - old_log_b).exp()
+            surr1 = ratio * adv_b
+            surr2 = torch.clamp(ratio, 1-0.2, 1+0.2) * adv_b
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # Value loss (clipped)
+            value_loss = F.mse_loss(value, ret_b)
+
+            loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
+            optimizer.step()
+
+    buffer.reset()
+
+    # --- Logging ---
+    if total_steps % 10_000 == 0:
+        success_rate = evaluate(net, env_key, seed, n_episodes=20)
+        log_csv(total_steps, success_rate, policy_loss, value_loss, entropy)
+        save_checkpoint(net, total_steps)
+
+  # Learning rate schedule: linear decay
+  lr_schedule = LinearSchedule(3e-4, 0.0, total_steps)
+  # Apply at each epoch: optimizer.param_groups[0]['lr'] = lr_schedule(total_steps)
+
+GAE computation (rollout_buffer.py):
+  advantages = zeros(T)
+  last_gae = 0
+  for t in reversed(range(T)):
+      if t == T-1:
+          next_value = last_value
+          next_non_terminal = 0 if done else 1
+      else:
+          next_value = values[t+1]
+          next_non_terminal = 1 - dones[t+1]
+      delta = rewards[t] + gamma * next_value * next_non_terminal - values[t]
+      last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+      advantages[t] = last_gae
+  returns = advantages + values
+
+------------------------------------------------------------------------
+4.2 Neural Dyna-Q Full Training Loop
+------------------------------------------------------------------------
+NOTE: This is Neural Dyna-Q — the transition model is a neural network,
+NOT a tabular lookup. See Section 12.2 for why tabular Dyna-Q is invalid
+for MiniGrid. All references to "tabular" in earlier drafts are superseded.
+------------------------------------------------------------------------
+
+  Initialize:
+    env = make_env(env_key, seed)
+    encoder = CNNEncoder(obs_shape).to(device)
+    online_net = QNetwork().to(device)
+    target_net = copy.deepcopy(online_net)
+    target_net.eval(); freeze(target_net)
+    transition_model = TransitionModel().to(device)
+    q_optimizer     = Adam(list(encoder.params()) + list(online_net.params()), lr=1e-4)
+    model_optimizer = Adam(transition_model.parameters(), lr=1e-3)
+    real_buffer = ReplayBuffer(capacity=50_000)
+    total_steps = 0
+    epsilon = 1.0
+
+  while total_steps < 500_000:
+
+    obs, _ = env.reset()
+
+    # --- One real environment step ---
+    z = encoder(obs_tensor).detach()
+    if random() < epsilon:
+        action = env.action_space.sample()
+    else:
+        action = online_net(z.unsqueeze(0)).argmax().item()
+
+    next_obs, reward, terminated, truncated, info = env.step(action)
+    done = terminated or truncated
+    real_buffer.push(obs, action, reward, next_obs, done)
+    obs = next_obs
+    total_steps += 1
+
+    # --- Decay epsilon ---
+    epsilon = max(0.05, 1.0 - (1.0 - 0.05) * total_steps / 50_000)
+
+    # Only start training after buffer has 1000 transitions
+    if len(real_buffer) < 1000:
+        continue
+
+    # --- Update transition model on real data ---
+    batch = real_buffer.sample(64)
+    z_b      = encoder(batch.obs).detach()
+    next_z_b = encoder(batch.next_obs).detach()
+    pred_next_z, pred_reward = transition_model(z_b, batch.actions)
+    model_loss = F.mse_loss(pred_next_z, next_z_b) + 0.5 * F.mse_loss(pred_reward, batch.rewards)
+    model_optimizer.zero_grad(); model_loss.backward(); model_optimizer.step()
+
+    # --- Update Q-network on real data ---
+    _update_q(encoder, online_net, target_net, q_optimizer, batch, gamma=0.99)
+
+    # --- Dyna Planning: k imagined steps ---
+    for _ in range(5):   # k = 5
+        # Sample a past real state
+        plan_batch = real_buffer.sample(64)
+        plan_z = encoder(plan_batch.obs).detach()
+
+        # Sample random action for imagination
+        plan_actions = torch.randint(0, n_actions, (64,))
+
+        # Simulate using learned model (no env interaction)
+        with torch.no_grad():
+            imag_next_z, imag_reward = transition_model(plan_z, plan_actions)
+
+        # Q update on imagined transition
+        # Build a synthetic batch: (z, a, r, next_z, done=False)
+        imag_batch = (plan_z, plan_actions, imag_reward, imag_next_z, zeros(64))
+        _update_q_latent(online_net, target_net, q_optimizer, imag_batch, gamma=0.99)
+
+    # --- Hard update target network ---
+    if total_steps % 500 == 0:
+        target_net.load_state_dict(online_net.state_dict())
+
+    # --- Logging ---
+    if total_steps % 10_000 == 0:
+        success_rate = evaluate_dyna(encoder, online_net, env_key, seed)
+        log_csv(total_steps, success_rate, model_loss.item())
+        save_checkpoint({'encoder': encoder, 'qnet': online_net}, total_steps)
+
+Q-update function _update_q():
+    z_b      = encoder(batch.obs)
+    next_z_b = encoder(batch.next_obs).detach()
+    with torch.no_grad():
+        next_q    = target_net(next_z_b).max(dim=1).values
+        target_q  = batch.rewards + gamma * next_q * (1 - batch.dones)
+    current_q = online_net(z_b).gather(1, batch.actions.unsqueeze(1)).squeeze()
+    loss = F.smooth_l1_loss(current_q, target_q)   # Huber loss
+    q_optimizer.zero_grad(); loss.backward(); q_optimizer.step()
+
+------------------------------------------------------------------------
+4.3 Dreamer-style World Model Full Training Loop
+------------------------------------------------------------------------
+NOTE: This implements the Dreamer paradigm (Hafner et al. 2019-2023).
+The world model is used ONLY during training to generate imagined rollouts
+for the actor-critic. At inference time, only the actor network is queried
+(single forward pass — no planning or tree search). See Section 12.3.
+------------------------------------------------------------------------
+
+  Initialize:
+    env = make_env(env_key, seed)
+    world_model = WorldModel(obs_shape).to(device)   # encoder+RSSM+decoder+predictors
+    actor  = LatentActor(state_dim=544, n_actions=6).to(device)
+    critic = LatentCritic(state_dim=544).to(device)
+    wm_optimizer     = Adam(world_model.parameters(), lr=6e-4, eps=1e-5)
+    actor_optimizer  = Adam(actor.parameters(),  lr=8e-5, eps=1e-5)
+    critic_optimizer = Adam(critic.parameters(), lr=8e-5, eps=1e-5)
+    seq_buffer = SequenceReplayBuffer(capacity=100_000, seq_len=50)
+    total_steps = 0
+    wm_warmup = 5_000     # steps before training actor-critic
+
+  while total_steps < 200_000:
+
+    # --- Collect one episode using current actor ---
+    obs, _ = env.reset()
+    h = world_model.init_hidden()    # zeros (1, 512)
+    episode_obs, episode_acts, episode_rews, episode_dones = [], [], [], []
+    done = False
+
+    while not done:
+        # Encode obs and update RSSM
+        with torch.no_grad():
+            z, h = world_model.observe_step(obs_tensor, h)
+            state = torch.cat([h, z], dim=-1)   # (1, 544)
+            if total_steps < wm_warmup:
+                action = env.action_space.sample()   # random during warmup
+            else:
+                action = actor.sample(state).item()
+
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        episode_obs.append(obs); episode_acts.append(action)
+        episode_rews.append(reward); episode_dones.append(done)
+        obs = next_obs
+        total_steps += 1
+
+    # Store episode as sequence
+    seq_buffer.push(episode_obs, episode_acts, episode_rews, episode_dones)
+
+    if len(seq_buffer) < 1:   # need at least one full episode
+        continue
+
+    # === World Model Training (every step) ===
+    seq_batch = seq_buffer.sample(batch_size=50, seq_len=50)
+    # seq_batch: dict with 'obs' (50,50,3,8,8), 'actions' (50,50), etc.
+
+    # Unroll RSSM on sequence
+    h = world_model.init_hidden(batch_size=50)
+    wm_loss = 0
+    for t in range(50):
+        obs_t  = seq_batch['obs'][:, t]         # (50, 3, 8, 8)
+        act_t  = seq_batch['actions'][:, t]      # (50,)
+        rew_t  = seq_batch['rewards'][:, t]      # (50,)
+        done_t = seq_batch['dones'][:, t]        # (50,)
+
+        # Posterior: q(z_t | h_t, o_t)
+        z_post, (mu_post, sig_post) = world_model.encode_posterior(h, obs_t)
+
+        # Prior:    p(z_t | h_t)
+        (mu_prior, sig_prior) = world_model.prior(h)
+
+        # Update GRU: h_{t+1} = GRU(h_t, z_t, a_t)
+        h = world_model.gru_step(h, z_post, act_t)
+
+        state = torch.cat([h, z_post], dim=-1)
+
+        # Losses
+        recon = world_model.decode(state)
+        L_recon  = F.mse_loss(recon, obs_t)
+        L_kl     = kl_divergence(mu_post, sig_post, mu_prior, sig_prior)
+        L_kl     = torch.clamp(L_kl, min=1.0).mean()    # free_nats=1.0
+        L_reward = F.mse_loss(world_model.predict_reward(state), rew_t)
+        L_cont   = F.binary_cross_entropy(world_model.predict_cont(state), 1-done_t)
+
+        wm_loss += L_recon + L_kl + L_reward + L_cont
+
+    wm_loss /= 50
+    wm_optimizer.zero_grad()
+    wm_loss.backward()
+    nn.utils.clip_grad_norm_(world_model.parameters(), max_norm=100)
+    wm_optimizer.step()
+
+    # === Actor-Critic Training on Imagined Rollouts ===
+    if total_steps > wm_warmup:
+        # Start from real encoded states (posterior z from random batch point)
+        with torch.no_grad():
+            start_states = sample_start_states_from_buffer(seq_buffer, world_model, n=50)
+            # start_states: (50, 544) — real encoded world states
+
+        # Imagine H=15 steps forward using prior + actor
+        imag_states = [start_states]
+        imag_rewards = []
+        imag_conts = []
+        state = start_states
+        for _ in range(15):   # H = 15
+            action_dist = actor(state)
+            action = action_dist.sample()                                    # (50,)
+            # Step world model in latent space (NO env interaction)
+            next_state = world_model.imagine_step(state, action)            # (50, 544)
+            imag_rewards.append(world_model.predict_reward(next_state))     # (50,)
+            imag_conts.append(world_model.predict_cont(next_state))         # (50,)
+            imag_states.append(next_state)
+            state = next_state
+
+        # Compute lambda-returns over imagined trajectory
+        values = [critic(s) for s in imag_states]                          # list of (50,)
+        lambda_returns = compute_lambda_returns(
+            imag_rewards, imag_conts, values, gamma=0.99, lam=0.95
+        )
+
+        # Actor loss (maximize lambda-returns)
+        actor_loss = -lambda_returns[:-1].mean()   # exclude last state
+        actor_optimizer.zero_grad(); actor_loss.backward(); actor_optimizer.step()
+
+        # Critic loss (regress to lambda-returns)
+        critic_preds = torch.stack(values[:-1], dim=0)
+        critic_loss = F.mse_loss(critic_preds, lambda_returns[:-1].detach())
+        critic_optimizer.zero_grad(); critic_loss.backward(); critic_optimizer.step()
+
+    # --- Logging ---
+    if total_steps % 5_000 == 0:
+        success_rate = evaluate_wm(world_model, actor, env_key, seed)
+        log_csv(total_steps, success_rate, wm_loss.item())
+        save_checkpoint({'wm': world_model, 'actor': actor, 'critic': critic}, total_steps)
+
+
+================================================================================
+SECTION 5: EVALUATION PROTOCOL
+================================================================================
+
+------------------------------------------------------------------------
+5.1 During-Training Evaluation
+------------------------------------------------------------------------
+
+Called from train.py every 10K steps (every 5K for world model).
+
+def evaluate(agent, env_key, seed, n_episodes=20):
+    eval_env = make_env(env_key, seed=seed+1000, record=True)  # different seed
+    successes = 0
+    total_steps = 0
+    total_return = 0
+
+    for ep in range(n_episodes):
+        obs, _ = eval_env.reset()
+        done = False
+        ep_return = 0
+        ep_steps = 0
+        while not done:
+            action = agent.act(obs, deterministic=True)   # NO exploration noise
+            obs, reward, terminated, truncated, info = eval_env.step(action)
+            done = terminated or truncated
+            ep_return += reward
+            ep_steps += 1
+        if terminated and reward > 0:   # reached goal (sparse reward)
+            successes += 1
+        total_steps += ep_steps
+        total_return += ep_return
+
+    success_rate = successes / n_episodes
+    mean_ep_len  = total_steps / n_episodes
+    mean_return  = total_return / n_episodes
+    return success_rate, mean_ep_len, mean_return
+
+For Dyna-Q: act() uses argmax(Q(s)) with epsilon=0.
+For PPO: act() uses mode of policy distribution.
+For World Model: act() uses mode of actor distribution given encoded state.
+
+------------------------------------------------------------------------
+5.2 Final Evaluation (evaluate.py)
+------------------------------------------------------------------------
+
+CLI: python evaluate.py \
+       --checkpoint results/checkpoints/ppo_doorkey_seed42_best.pt \
+       --agent ppo \
+       --env doorkey \
+       --seed 42 \
+       --n_episodes 100 \
+       --output results/tables/
+
+Runs 100 episodes, records per-episode:
+  episode_id, success, steps_to_goal (or -1 if fail), total_return, wall_time_sec
+
+Saves to results/tables/eval_{agent}_{env}_seed{N}.csv
+
+Aggregated into results/tables/main_results.csv:
+  agent, env, seed, final_success_rate, final_success_std,
+  steps_to_80pct_success, mean_ep_length_on_success,
+  mean_return, wall_time_to_80pct_min
+
+------------------------------------------------------------------------
+5.3 Generalization Test
+------------------------------------------------------------------------
+
+CLI: python evaluate.py --mode generalization \
+       --checkpoint results/checkpoints/ppo_doorkey_seed42_best.pt \
+       --agent ppo --env doorkey --gen_env doorkey_16x16 --n_episodes 100
+
+Generalization environments (16x16 versions):
+  MiniGrid-Empty-16x16-v0
+  MiniGrid-DoorKey-16x16-v0       (need to verify this exists, else use size param)
+  MiniGrid-MultiRoom-N4-S8-v0    (larger rooms)
+  MiniGrid-KeyCorridor-S4-R2-v0  (larger version)
+
+Zero-shot evaluation: load checkpoint, eval on larger env, no fine-tuning.
+Record: success_rate_16x16, delta = success_8x8 - success_16x16
+
+------------------------------------------------------------------------
+5.4 Log File Schema
+------------------------------------------------------------------------
+
+results/logs/{agent}_{env}_seed{N}.csv columns:
+  step              INT    — env steps elapsed
+  success_rate      FLOAT  — fraction of eval episodes that reached goal
+  mean_ep_length    FLOAT  — mean steps per episode in eval
+  mean_return       FLOAT  — mean undiscounted return in eval
+  wall_time_sec     FLOAT  — wall clock time since training start
+  policy_loss       FLOAT  — most recent policy/actor loss
+  value_loss        FLOAT  — most recent value/critic loss
+  entropy           FLOAT  — most recent policy entropy (PPO/WM only)
+  model_loss        FLOAT  — transition model loss (DynaQ/WM only)
+  kl_loss           FLOAT  — KL divergence loss (WM only)
+  recon_loss        FLOAT  — reconstruction loss (WM only)
+  epsilon           FLOAT  — exploration epsilon (DynaQ only)
+  grad_norm         FLOAT  — gradient norm before clipping
+
+
+================================================================================
+SECTION 6: VISUALIZATIONS — FULL SPECIFICATION
+================================================================================
+
+Run all: python visualize.py --results_dir results/
+
+------------------------------------------------------------------------
+FIGURE 1: Learning Curves (main result figure)
+------------------------------------------------------------------------
+
+File: results/plots/learning_curves_{env}.png  (4 files, one per env)
+Also: results/plots/learning_curves_all.png    (2x2 grid of all 4 envs)
+
+What it shows:
+  Success rate (y) over environment steps (x), per agent.
+  Shaded area = mean ± 1 std across 3 seeds.
+
+Construction:
+  For each agent, load all 3 seed CSVs.
+  Interpolate all to common step grid (0, 1K, 2K, ..., 500K).
+  Compute mean and std at each step.
+
+Matplotlib spec:
+  Figure size: (10, 7) for single env, (14, 10) for 2x2 grid
+  PPO line:         color="#2196F3" (blue),   linewidth=2.5, label="PPO (Model-Free)"
+  Dyna-Q line:      color="#FF9800" (orange), linewidth=2.5, label="Dyna-Q (Model-Based)"
+  World Model line: color="#4CAF50" (green),  linewidth=2.5, label="World Model + Planning"
+  Shaded fill:      alpha=0.15, same color as line
+  X-axis: "Environment Steps", range [0, 500K], ticks at [0, 100K, 200K, 300K, 400K, 500K]
+  Y-axis: "Success Rate", range [0, 1.0], ticks at [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+  Horizontal dashed lines at y=0.5 and y=0.8 (reference thresholds), color="gray", alpha=0.5
+  Legend: upper left, fontsize=11
+  Title: env name (e.g., "DoorKey-8x8"), fontsize=14, fontweight="bold"
+  Grid: True, alpha=0.3
+  Style: seaborn-v0_8-whitegrid
+
+------------------------------------------------------------------------
+FIGURE 2: Sample Efficiency Bar Chart
+------------------------------------------------------------------------
+
+File: results/plots/sample_efficiency_50pct.png
+      results/plots/sample_efficiency_80pct.png
+
+What it shows:
+  Env steps required to first reach 50% / 80% success (lower = better).
+  If agent never reaches threshold, bar = max_steps with hatching.
+
+Matplotlib spec:
+  Figure size: (12, 6)
+  4 groups (one per env), 3 bars per group
+  Bar width: 0.25, grouped with 0.05 gap between bars in same group
+  Colors: same as Figure 1 (blue, orange, green)
+  Error bars: ±1 std across seeds, capsize=5
+  "Did not reach" bars: full height + diagonal hatch pattern "/" alpha=0.4
+  X-axis: env names ["Empty-8x8", "DoorKey-8x8", "MultiRoom-N4-S5", "KeyCorridor"]
+  Y-axis: "Steps to Threshold (K)", values in thousands
+  Legend: upper right
+  Annotate each bar with exact value (e.g., "142K") above the bar, fontsize=9
+
+------------------------------------------------------------------------
+FIGURE 3: Wall-Clock Time Comparison
+------------------------------------------------------------------------
+
+File: results/plots/wallclock.png
+
+Same layout as Figure 2 but y-axis is minutes of wall-clock time to reach 80%.
+This captures the compute overhead of model-based methods.
+Secondary annotation: steps_per_second for each agent (printed in subplot title).
+
+------------------------------------------------------------------------
+FIGURE 4: Generalization Heatmap
+------------------------------------------------------------------------
+
+File: results/plots/generalization_heatmap.png
+
+Two side-by-side heatmaps:
+  Left:  success rate on 16x16 (absolute)
+  Right: success rate delta = 8x8 success - 16x16 success (higher delta = worse transfer)
+
+Matplotlib spec:
+  Figure size: (14, 5)
+  Rows: agents (PPO, Dyna-Q, World Model)
+  Cols: envs (Empty, DoorKey, MultiRoom, KeyCorridor)
+  Left colormap:  "RdYlGn" (red=0, green=1)
+  Right colormap: "RdYlGn_r" (red=high drop, green=low drop)
+  Annotate each cell with value to 2 decimal places
+  Colorbar on right of each heatmap
+  Title for each heatmap
+  Use seaborn.heatmap() with square=True, linewidths=0.5
+
+------------------------------------------------------------------------
+FIGURE 5: World Model Prediction Accuracy
+------------------------------------------------------------------------
+
+File: results/plots/model_accuracy.png
+
+Two panels:
+
+  Left panel — Reward prediction scatter:
+    X: predicted reward, Y: actual reward
+    Color: training step (viridis colormap, dark=late training)
+    Plot diagonal (y=x) as perfect prediction reference
+    Title: "Reward Prediction Accuracy"
+
+  Right panel — Latent state prediction (PCA):
+    Compute PCA (2 components) of all latent states from eval episodes
+    Blue points: actual next state (posterior z)
+    Red points:  predicted next state (prior z, one step ahead)
+    Arrows from predicted to actual to show error
+    Color intensity: prediction error magnitude (darker = higher error)
+    Only show 200 sample points to avoid clutter
+    Title: "Latent State Prediction (PCA)"
+
+Construction:
+  Load world model checkpoint at 10K, 50K, 100K, 200K steps
+  Run 10 eval episodes, collect (z_pred, z_actual, r_pred, r_actual) pairs
+  Concatenate across checkpoints, color by checkpoint step
+
+------------------------------------------------------------------------
+FIGURE 6: Imagined vs Real Trajectories
+------------------------------------------------------------------------
+
+File: results/plots/trajectory_comparison.png
+
+Layout: 5 rows x 2 columns (5 episodes, left=real, right=imagined)
+For each episode:
+  Left: 5 rendered frames from real env (every 3 steps of a 15-step episode)
+  Right: 5 decoded frames from world model imagination starting from same init state
+  Frames shown as MiniGrid RGB renders (use env.render(mode="rgb_array"))
+  For decoded frames: world_model.decode(imagined_state) reshaped to (3,8,8) and un-normalized
+
+Caption per row: "Episode N: Real (left) vs Imagined (right)"
+Mark success/failure on each frame sequence.
+
+This figure demonstrates whether the world model has learned coherent dynamics.
+
+------------------------------------------------------------------------
+FIGURE 7: Policy Evolution GIFs
+------------------------------------------------------------------------
+
+Files: results/gifs/{agent}_{env}_step{N}K.gif
+  e.g., results/gifs/worldmodel_doorkey_step050K.gif
+
+For checkpoints at: 0, 25K, 50K, 100K, 200K steps (5 GIFs per agent per env)
+Each GIF: 1 full episode, rendered at 10 FPS, max 200 frames
+Overlay text on each frame: "Step: {N}K  Action: {action_name}  Reward: {r:.2f}"
+Use imageio.mimsave(path, frames, fps=10)
+
+Construction:
+  Load checkpoint at each step
+  Roll out one deterministic episode
+  Collect env.render(mode="rgb_array") at each step
+  Resize frames to 256x256 using PIL.Image.resize (NEAREST for pixel art)
+  Add text overlay using PIL.ImageDraw
+  Save as GIF
+
+Special: for World Model, create a split GIF (left=real, right=what model imagined)
+
+------------------------------------------------------------------------
+FIGURE 8: Agent Visitation Heatmaps
+------------------------------------------------------------------------
+
+File: results/plots/visitation_{env}.png  (one per env, showing all 3 agents)
+
+Layout: 1 row, 3 columns (PPO | Dyna-Q | World Model)
+For first 10K real env steps:
+  Record (x, y) position of agent at every step
+  Build 2D histogram over grid cells
+  Overlay heatmap on top of env grid image
+
+Matplotlib spec:
+  Grid image as background (imshow the env layout)
+  Heatmap on top with alpha=0.6, colormap="hot" (black=low, yellow=high frequency)
+  Title: "{agent} — {env} (first 10K steps)"
+  Colorbar labeled "Visit Frequency"
+
+Key observation to highlight:
+  PPO: near-uniform random visitation (exploration bottleneck)
+  Dyna-Q: slightly more directed (model provides guidance)
+  World Model: structured exploration toward goal-relevant states
+
+------------------------------------------------------------------------
+FIGURE 9: Failure Mode Gallery
+------------------------------------------------------------------------
+
+File: results/plots/failure_modes_{env}.png
+
+Layout: 3 rows (agents) x 3 columns (3 failure examples each)
+Each cell: a 4-frame sequence showing the failure
+  Frame 1: initial state
+  Frame 2: mid-episode (key decision point)
+  Frame 3: point of failure
+  Frame 4: final state (episode timeout or wrong termination)
+
+Annotations (per cell):
+  Agent name, failure type, steps taken before failure
+  Text box overlay: "FAILURE: [reason]"
+
+Failure types to capture and annotate:
+  PPO:         "Timeout: never found key" / "Loop: repeated same corridor"
+  Dyna-Q:      "Model error: attempted wall traversal" / "Wrong plan: went to wrong door"
+  World Model: "Horizon too short: stopped planning 2 steps early" / "Hallucinated shortcut"
+
+------------------------------------------------------------------------
+FIGURE 10: Planning Ratio Ablation (Dyna-Q)
+------------------------------------------------------------------------
+
+File: results/plots/ablation_planning_ratio.png
+
+5 curves for k ∈ {0, 1, 5, 10, 20} on DoorKey-8x8, seed=42
+k=0 is equivalent to standard DQN (no planning)
+Learning curves overlaid, same style as Figure 1
+Add vertical marker at the step where each k first reaches 80%
+Conclusion annotation: "Optimal k = 5 (diminishing returns beyond)"
+
+------------------------------------------------------------------------
+FIGURE 11: Imagination Horizon Ablation (World Model)
+------------------------------------------------------------------------
+
+File: results/plots/ablation_horizon.png
+
+5 curves for H ∈ {5, 10, 15, 20, 25} on MultiRoom, seed=42
+Learning curves overlaid
+Annotate with sample efficiency at 80% threshold
+Conclusion: longer horizon helps but increases compute quadratically
+
+------------------------------------------------------------------------
+FIGURE 12: Credit Assignment Analysis
+------------------------------------------------------------------------
+
+File: results/plots/credit_assignment.png
+
+For DoorKey-8x8, analyze 1000 eval episodes per agent:
+  X: episode number
+  Y: step at which agent first picks up the key (normalized 0-1)
+  If agent never picks up key: mark as 1.0 (failure)
+
+Left panel: violin plot of "time to key pickup" distribution per agent
+Right panel: learning curve of "key pickup rate" (fraction of episodes where key is
+  picked up at all) over training steps
+
+Key finding annotation: "World Model learns key pickup earlier, enabling goal solving"
+
+------------------------------------------------------------------------
+FIGURE 13: State Coverage Over Training
+------------------------------------------------------------------------
+
+File: results/plots/state_coverage.png
+
+X: training steps (0 to 50K)
+Y: unique (x,y) grid cells visited as fraction of total navigable cells
+3 lines (one per agent)
+Shows exploration efficiency: world model should cover more states faster
+Shaded: ±1 std across 3 seeds
+
+
+================================================================================
+SECTION 7: ABLATIONS AND ANALYSIS
+================================================================================
+
+------------------------------------------------------------------------
+7.1 Ablation Experiments
+------------------------------------------------------------------------
+
+All ablations use seed=42 only (not 3 seeds, to save compute).
+All ablations run on DoorKey-8x8 unless otherwise noted (hardest tractable env).
+
+Ablation A — Dyna-Q Planning Ratio:
+  k ∈ {0, 1, 5, 10, 20}
+  Total: 5 runs x 200K steps each
+  Metric: steps to 80% success, final success at 200K steps
+  Expected: k=0 (pure DQN) slowest, k=5 best, k=20 may hurt (model errors)
+
+Ablation B — World Model Imagination Horizon:
+  H ∈ {5, 10, 15, 20, 25}
+  Total: 5 runs x 200K steps each
+  Metric: same as above
+  Expected: H=5 too short for credit assignment, H=15-20 optimal, H=25 unstable
+
+Ablation C — Fully Obs vs Partially Obs:
+  Run all 3 agents on DoorKey with partial obs (7x7 window)
+  Compare success curves vs full obs
+  Expected: all agents suffer, model-based suffers less (can maintain memory via RSSM)
+
+Ablation D — Model Quality Impact (Dyna-Q):
+  Vary model training data: use only last 5K / 10K / 50K transitions (buffer size)
+  Smaller buffer = less accurate model (higher error, older data)
+  Shows how model quality directly affects sample efficiency
+
+------------------------------------------------------------------------
+7.2 Statistical Analysis
+------------------------------------------------------------------------
+
+For main results, compute across 3 seeds:
+  Mean and standard deviation of success rate at each eval step
+  95% confidence interval: mean ± 1.96 * std / sqrt(3)
+  (Note: 3 seeds is small — report this limitation in discussion)
+
+Significance testing (final success rates):
+  For each (agent_A, agent_B, env) pair:
+    Welch's t-test on final_success_rate across 3 seeds
+    Report p-value — flag if p > 0.05 (not statistically significant)
+  Example: "World Model significantly outperforms PPO on DoorKey (p=0.02)"
+
+Effect size:
+  Cohen's d = (mean_A - mean_B) / pooled_std
+  Report alongside p-values
+
+Sample efficiency metric derivation:
+  For each run, find first step t where success_rate >= threshold
+  If never reached: t = total_steps (conservative)
+  This is "steps to threshold" — lower = more efficient
+
+------------------------------------------------------------------------
+7.3 Correlation Analysis
+------------------------------------------------------------------------
+
+Model Quality vs Policy Performance (Dyna-Q and World Model):
+  At each eval step, log: model_loss, success_rate
+  Compute Pearson r across all steps for a single run
+  Also compute lagged correlation (does model loss t-1000 predict success at t?)
+  Plot scatter: model_loss vs success_rate, fit linear trendline
+  Expected: negative correlation (lower model loss -> higher success)
+
+Latent Space Structure (World Model):
+  After training, encode 10K obs from DoorKey into latent z
+  Run t-SNE (perplexity=30) to project to 2D
+  Color by: (a) agent x-position, (b) whether holding key, (c) distance to goal
+  Check if latent space organizes semantically (holding-key cluster vs not)
+  File: results/plots/tsne_latent_space.png
+
+
+================================================================================
+SECTION 8: VERIFICATION CHECKLIST
+================================================================================
+
+Run these checks BEFORE launching full 36-run experiment suite.
+
+------------------------------------------------------------------------
+8.1 Environment Checks
+------------------------------------------------------------------------
+  [ ] All 4 envs import without error:
+        for env_key in ["empty","doorkey","multiroom","keycorridor"]:
+            env = make_env(env_key, seed=42)
+            obs, _ = env.reset()
+            assert obs.shape == (3, 8, 8), f"Bad obs shape: {obs.shape}"
+            assert obs.dtype == np.float32
+            assert obs.min() >= 0.0 and obs.max() <= 1.0
+  [ ] Env steps without crash for 100 random steps
+  [ ] Sparse reward: manually reach goal, confirm reward > 0
+  [ ] Reward = 0 for non-goal steps: sample 1000 random transitions, all rewards = 0
+  [ ] Episode terminates when goal reached
+  [ ] Episode terminates at max_steps if goal not reached
+  [ ] Seeding reproducible: two resets with same seed give identical obs
+
+------------------------------------------------------------------------
+8.2 PPO Checks
+------------------------------------------------------------------------
+  [ ] Loss decreases in first 10K steps on Empty-8x8
+  [ ] Policy entropy > 0.5 at step 0 (not collapsed)
+  [ ] Gradient norm printed each update — should be << 10 after clipping
+  [ ] Success rate on Empty-8x8 > 50% by 100K steps (sanity check)
+  [ ] Success rate on Empty-8x8 > 90% by 300K steps
+  [ ] Value function: check V(s) is ~0 at episode start, rises near goal
+  [ ] No NaN in any logged quantity — add assert not any(torch.isnan(loss))
+  [ ] Linear LR decay works: lr at step 500K should be ~0
+
+------------------------------------------------------------------------
+8.3 Dyna-Q Checks
+------------------------------------------------------------------------
+  [ ] Transition model loss decreases in first 5K steps
+  [ ] Imagined rewards are not all 0 or all 1 (model is learning)
+  [ ] Q-values are bounded: check max(|Q(s,a)|) < 100
+  [ ] Epsilon is decaying correctly: print epsilon every 10K steps
+  [ ] Planning (k=5) gives better performance than k=0 by 100K steps
+  [ ] Replay buffer fills within first 50K steps (check __len__)
+  [ ] Target network updated correctly: verify params differ from online after update
+
+------------------------------------------------------------------------
+8.4 World Model Checks
+------------------------------------------------------------------------
+  [ ] RSSM prior KL > free_nats after warmup (not stuck at 0)
+  [ ] Reconstruction MSE decreases in first 10K steps
+  [ ] Decoded frames at 20K steps are visually coherent (not noise)
+        decoded = world_model.decode(state).reshape(3, 8, 8)
+        save_image(decoded, "debug_decode.png")  # inspect manually
+  [ ] Imagined rollouts have variable length (continuation predictor working)
+  [ ] Actor loss decreasing after warmup ends
+  [ ] World model solves Empty-8x8 at >80% by 30K real env steps (fast)
+  [ ] No gradient explosion: assert grad_norm < 1000 before clipping
+
+------------------------------------------------------------------------
+8.5 Visualization Checks (run before full training)
+------------------------------------------------------------------------
+  [ ] Test all plot functions with dummy random data:
+        python visualize.py --debug  (generates all plots with random CSV data)
+  [ ] All 11+ PNG files saved in results/plots/ without error
+  [ ] GIF test: generate 10-frame GIF from random env render, verify it plays
+  [ ] Heatmap color direction is correct (green=high success, not reversed)
+  [ ] Learning curve shading has nonzero width (using multiple seeds)
+  [ ] All matplotlib figures close after saving (plt.close() called)
+
+------------------------------------------------------------------------
+8.6 End-to-End Test
+------------------------------------------------------------------------
+  [ ] Run PPO on Empty-8x8 for 1K steps: no crash, CSV log created
+  [ ] Run Dyna-Q on Empty-8x8 for 1K steps: no crash, model loss logged
+  [ ] Run World Model on Empty-8x8 for 1K steps: no crash, WM loss logged
+  [ ] Evaluate.py loads a checkpoint and runs 5 episodes successfully
+  [ ] All CSV columns present and non-NaN for first 1K steps
+  [ ] Checkpoint save + load works: save at step 1K, reload, continue training
+
+
+================================================================================
+SECTION 9: RUN SCRIPTS
+================================================================================
+
+------------------------------------------------------------------------
+run_experiments.sh (sequential, CPU or single GPU)
+------------------------------------------------------------------------
+
+#!/bin/bash
+set -e
+
+AGENTS=("ppo" "dynaq" "worldmodel")
+ENVS=("empty" "doorkey" "multiroom" "keycorridor")
+SEEDS=(42 123 777)
+TOTAL_STEPS=500000
+
+mkdir -p results/logs results/checkpoints results/plots results/gifs results/tables
+
+for agent in "${AGENTS[@]}"; do
+  for env in "${ENVS[@]}"; do
+    for seed in "${SEEDS[@]}"; do
+      echo "========================================"
+      echo "  Agent: $agent | Env: $env | Seed: $seed"
+      echo "========================================"
+      python train.py \
+        --agent $agent \
+        --env $env \
+        --seed $seed \
+        --config configs/${agent}_${env}.yaml \
+        --save_dir results/ \
+        --total_steps $TOTAL_STEPS \
+        --log_interval 10000 \
+        --eval_episodes 20 \
+        --checkpoint_interval 10000
+      echo "Done: $agent $env seed=$seed"
+    done
+  done
+done
+
+echo "All 36 training runs complete."
+python visualize.py --results_dir results/
+echo "All visualizations generated. Check results/plots/"
+
+# Estimated time (CPU, single core):
+#   PPO:         ~2h per run x 12 runs = ~24h
+#   Dyna-Q:      ~3h per run x 12 runs = ~36h
+#   World Model: ~5h per run x 12 runs = ~60h
+#   Total: ~120h CPU (5 days) — use GPU or parallel script below
+
+------------------------------------------------------------------------
+run_experiments_parallel.sh (parallel, multi-GPU)
+------------------------------------------------------------------------
+
+#!/bin/bash
+# Requires: tmux or GNU parallel
+# Assigns one GPU per agent type if 3 GPUs available
+
+GPU_PPO=0; GPU_DYNAQ=1; GPU_WM=2
+
+for env in "empty" "doorkey" "multiroom" "keycorridor"; do
+  for seed in 42 123 777; do
+    CUDA_VISIBLE_DEVICES=$GPU_PPO python train.py \
+      --agent ppo --env $env --seed $seed &
+    CUDA_VISIBLE_DEVICES=$GPU_DYNAQ python train.py \
+      --agent dynaq --env $env --seed $seed &
+    CUDA_VISIBLE_DEVICES=$GPU_WM python train.py \
+      --agent worldmodel --env $env --seed $seed &
+    wait   # wait for all 3 to finish before moving to next env/seed combo
+  done
+done
+
+# Estimated time with 3 GPUs: ~12h total
+
+
+================================================================================
+SECTION 10: EXPECTED QUANTITATIVE RESULTS
+================================================================================
+
+The following are pre-experiment hypotheses based on literature.
+Actual results will confirm, refute, or nuance these.
+
+------------------------------------------------------------------------
+10.1 Sample Efficiency (steps to 80% success)
+------------------------------------------------------------------------
+
+                  Empty-8x8    DoorKey-8x8   MultiRoom     KeyCorridor
+  PPO             ~30K         ~300K         ~400K         ~500K (may not reach)
+  Dyna-Q          ~15K         ~150K         ~200K         ~350K
+  World Model     ~10K         ~80K          ~100K         ~200K
+
+  World Model speedup vs PPO:
+    Empty:        3x   (less impressive — task is too easy)
+    DoorKey:      3.75x
+    MultiRoom:    4x
+    KeyCorridor:  2.5x (world model struggles with very long horizons)
+
+------------------------------------------------------------------------
+10.2 Final Success Rates (at 500K steps for PPO/DynaQ, 200K for WM)
+------------------------------------------------------------------------
+
+                  Empty    DoorKey   MultiRoom   KeyCorridor
+  PPO             0.95     0.75      0.60        0.35
+  Dyna-Q          0.97     0.85      0.72        0.55
+  World Model     0.98     0.90      0.80        0.65
+
+Note: if PPO is given 200K steps to match World Model's real-env budget,
+expected DoorKey success: ~0.40 (much lower than WM's 0.90)
+
+------------------------------------------------------------------------
+10.3 Wall-Clock Time to 80% Success (minutes, CPU)
+------------------------------------------------------------------------
+
+                  Empty    DoorKey   MultiRoom   KeyCorridor
+  PPO             8 min    100 min   150 min     —
+  Dyna-Q          15 min   120 min   200 min     250 min
+  World Model     25 min   140 min   200 min     300 min
+
+Takeaway: model-based is NOT faster in wall-clock on easy tasks.
+  The compute overhead of planning only pays off when real-env steps are expensive.
+  On CPU: Dyna-Q overhead 1.5x, World Model overhead 2-2.5x vs PPO.
+
+------------------------------------------------------------------------
+10.4 Generalization (16x16, zero-shot)
+------------------------------------------------------------------------
+
+                  Empty    DoorKey   MultiRoom   KeyCorridor
+  PPO             0.40     0.05      0.02        0.00
+  Dyna-Q          0.55     0.15      0.08        0.02
+  World Model     0.65     0.30      0.20        0.08
+
+World Model generalizes best because:
+  - Latent dynamics model captures abstract "pick up key -> can open door"
+  - Not tied to absolute grid positions like PPO's memorized policy
+  - Can imagine novel layouts during planning
+
+------------------------------------------------------------------------
+10.5 Failure Mode Characterization
+------------------------------------------------------------------------
+
+PPO:
+  - Primary failure: exploration bottleneck (never finds key in DoorKey)
+  - Secondary: correct behavior at 8x8 breaks at 16x16 (overfit to layout)
+  - Symptom: high variance in success, many episodes stuck at 0 reward
+
+Dyna-Q:
+  - Primary failure: model error compounding (incorrect transition predictions)
+  - Symptom: model confidently predicts wrong next state, misleads policy
+  - Especially bad early training when model has little data
+  - Can recover: as model improves, policy improves too
+
+World Model:
+  - Primary failure: imagination horizon too short for KeyCorridor
+  - Secondary: poor model with insufficient data (first 5K steps random behavior)
+  - Symptom: plans that look good in imagination but fail in reality (model mismatch)
+  - Recovery: longer training fixes model quality, but horizon is a hard constraint
+
+
+================================================================================
+SECTION 11: REPORT OUTLINE (for final writeup)
+================================================================================
+
+The final project report will be structured as follows.
+Each section maps to the experiments above.
+
+  1. Introduction (1 page)
+     - Sample efficiency problem in RL
+     - Model-free vs model-based tradeoffs
+     - Our contribution: systematic comparison on sparse-reward tasks
+
+  2. Background (1 page)
+     - PPO: policy gradient, clipped surrogate objective
+     - Dyna-Q: model learning + planning ratio
+     - World Models: RSSM, latent imagination, DreamerV3 lineage
+
+  3. Methods (1.5 pages)
+     - Environments and preprocessing
+     - Architecture details (cites Section 3 above)
+     - Training procedures (cites Section 4 above)
+     - Evaluation protocol
+
+  4. Results (2 pages)
+     - Learning curves (Figure 1) — main result
+     - Sample efficiency (Figure 2) — quantitative comparison
+     - Wall-clock comparison (Figure 3) — practical tradeoff
+     - Generalization (Figure 4) — transfer ability
+
+  5. Analysis (1.5 pages)
+     - World model accuracy (Figure 5) — what the model learned
+     - Trajectory comparison (Figure 6) — imagination quality
+     - Visitation heatmaps (Figure 8) — exploration behavior
+     - Credit assignment analysis (Figure 12) — WHY model-based wins
+     - Ablations: planning ratio and horizon
+
+  6. Discussion (0.5 page)
+     - When to use model-based (sparse rewards, expensive envs, need generalization)
+     - When to use model-free (dense rewards, complex dynamics, speed matters)
+     - Limitations: 3 seeds, small envs, CPU compute
+
+  7. Conclusion (0.25 page)
+     - Summary of findings
+     - Future work: hierarchical RL, real robot transfer
+
+================================================================================
+SECTION 12: CRITICAL ARCHITECTURAL REVIEW AND REQUIRED CORRECTIONS
+================================================================================
+
+This section documents a formal review of the plan above, identifies two major
+architectural issues that MUST be resolved before coding begins, and provides
+a phased implementation roadmap to avoid compounding debugging problems.
+
+--------------------------------------------------------------------------------
+12.1 WHAT THE PLAN GETS RIGHT
+--------------------------------------------------------------------------------
+
+Clear spectrum of methods:
+  Comparing PPO (pure model-free), Dyna-Q (classical model-based), and
+  World Model + Planning (deep latent model) provides a complete, principled
+  view of both paradigms. The three methods sit at distinct points on the
+  model-free/model-based axis, making differences interpretable.
+
+Environment choice:
+  MiniGrid is the correct choice. It avoids the massive compute burden of
+  pixel-based environments (Atari, MuJoCo) while remaining genuinely hard
+  due to sparse rewards and long-horizon tasks. The 4-env difficulty ladder
+  (Empty -> DoorKey -> MultiRoom -> KeyCorridor) isolates exactly which
+  properties (credit assignment, exploration, horizon length) differentiate
+  the algorithms.
+
+Metric design:
+  Tracking sample efficiency + wall-clock overhead + zero-shot generalization
+  gives a complete engineering picture. Most papers only report sample
+  efficiency; including wall-clock exposes the real computational tradeoff
+  that practitioners actually face.
+
+--------------------------------------------------------------------------------
+12.2 ARCHITECTURAL ISSUE #1: DYNA-Q — TABULAR VS NEURAL (CRITICAL FIX)
+--------------------------------------------------------------------------------
+
+THE PROBLEM:
+  Classic Dyna-Q (Sutton 1990) is a tabular algorithm. It stores a lookup
+  table T[s][a] -> (s', r) where s and a are discrete indices. This works
+  only when the state space is small enough to enumerate completely.
+
+  MiniGrid environments are NOT tabular-friendly:
+    - Even Empty-8x8 has thousands of unique (position, direction, obs) states
+    - DoorKey, MultiRoom, KeyCorridor have state spaces in the tens of thousands
+    - Partial observability means two visually different observations can map to
+      the same lookup key, breaking the tabular assumption entirely
+    - The tabular version would require the agent to visit every state many times
+      before the model is useful — defeating the purpose of model-based learning
+
+  If you implement standard tabular Dyna-Q on MiniGrid it will:
+    (a) Never converge on MultiRoom or KeyCorridor (too many states)
+    (b) Produce a misleading comparison (tabular vs deep is not a fair fight)
+    (c) Fail to demonstrate the actual advantages of model-based learning
+
+THE FIX — Neural Dyna-Q (Deep Dyna-Q):
+  Replace the lookup table with two neural networks:
+
+  Policy/Value Network: Deep Q-Network (DQN) with CNN encoder
+    - Same architecture as described in Section 3.2 of this plan
+    - Q(s, a) approximated by CNN -> MLP -> n_actions outputs
+    - Trained with Double DQN loss + experience replay + target network
+
+  Transition Model: Neural network f_theta(s, a) -> (s', r)
+    - Parametric neural model as described in Section 3.4 of this plan
+    - Trained via supervised regression on real (s, a, s', r) tuples
+    - Model generalizes across unseen states via learned features
+    - This IS what Section 3.4 describes — but the text must never refer to
+      "tabular or parametric" as if both are valid options. Only parametric
+      (neural) is valid for MiniGrid.
+
+  Planning in Neural Dyna-Q:
+    - Instead of Dyna-Q's table lookup: sample state z from replay buffer,
+      sample action, run neural model to get (z', r), add to training batch
+    - Policy update uses BOTH real transitions and model-generated transitions
+    - This is equivalent to the original Dyna-Q concept but operates in
+      learned feature space rather than raw state space
+
+  CONCRETE CODE CHANGE:
+  The original Dyna-Q planning loop in Section 4.2 already implements this
+  correctly (uses encoder + transition_model). The only required fix is:
+    1. Remove all references to "tabular" from configs and comments
+    2. Ensure the encoder is trained jointly with the Q-network (not frozen)
+       OR use a separate frozen encoder pretrained on reconstruction
+    3. Label this explicitly as "Neural Dyna-Q" everywhere in code and report
+
+  Updated agent label: "Neural Dyna-Q" (not just "Dyna-Q")
+  Updated citation: Sutton 1990 (original Dyna-Q) + Pan et al. 2018
+    "Organizing Experience: A Deeper Look at Replay Mechanisms for Sample-Efficient
+    Deep Reinforcement Learning" — extends Dyna-Q to deep neural networks
+
+  Why this matters for the comparison:
+    Neural Dyna-Q is a fair competitor to PPO and World Model because all three
+    use neural function approximation. The comparison then isolates the effect
+    of the world model (present vs absent vs deep), not the effect of
+    representation capacity.
+
+--------------------------------------------------------------------------------
+12.3 ARCHITECTURAL ISSUE #2: WORLD MODEL — PLANNING VS POLICY IMAGINATION
+--------------------------------------------------------------------------------
+
+THE PROBLEM:
+  The plan currently conflates two fundamentally different approaches to using
+  a world model at decision time. Both are valid — but they are NOT the same
+  algorithm and cannot be implemented as one thing.
+
+  Approach A — Online Planning / MPC (MuZero-style):
+    AT EVERY DECISION STEP during execution:
+      1. Encode current obs into latent state z_t
+      2. Simulate K action sequences forward H steps using world model
+      3. Score each sequence by predicted cumulative reward
+      4. Execute first action of best sequence
+      5. Repeat at next step
+    Key property: the "policy" is the planning procedure itself, not a trained
+    network. There is no separate actor network that gets trained offline.
+    Inference is SLOW because planning runs at every step.
+    Sample efficiency is VERY HIGH because planning fully uses the world model.
+
+  Approach B — Policy Imagination / Dreamer (DreamerV3-style):
+    DURING TRAINING (offline):
+      1. Collect real experience, store in replay buffer
+      2. Train world model (RSSM) on real sequences
+      3. Starting from real encoded states, imagine H-step rollouts in LATENT SPACE
+      4. Train actor-critic on those imagined rollouts
+    AT DECISION TIME (execution):
+      1. Encode current obs into latent state z_t
+      2. Query the TRAINED ACTOR NETWORK: action = actor(z_t)
+      3. Execute action — NO planning or simulation at inference
+    Key property: inference is FAST (single forward pass through actor).
+    Training is expensive (world model + actor-critic), but inference is reactive.
+
+  Why this matters:
+    - Wall-clock comparison changes completely depending on which you implement
+    - Online planning: fast to train, slow to run
+    - Policy imagination: slow to train (in wall time), fast to run
+    - MuZero-style requires a search algorithm (MCTS or random shooting)
+    - Dreamer requires a full actor-critic training loop on imagined data
+
+  The original plan MIXED both: it described RSSM training (Dreamer) but then
+  said "at each decision step simulate action sequences" (MuZero/MPC).
+  These are mutually exclusive at inference time.
+
+THE DECISION — Use Policy Imagination (Dreamer approach):
+  REASON 1: Dreamer is more tractable to implement correctly for a course project.
+    MuZero requires a tree search (MCTS) implementation which is an entire
+    separate engineering effort orthogonal to the RL comparison.
+
+  REASON 2: Dreamer's inference speed makes evaluation and GIF generation fast.
+    Online planning would make collecting 100 eval episodes prohibitively slow.
+
+  REASON 3: Dreamer is the more influential and well-documented paradigm.
+    DreamerV1 (Hafner 2019), DreamerV2 (Hafner 2020), DreamerV3 (Hafner 2023)
+    all have open-source reference implementations to cross-check against.
+
+  REASON 4: The Dreamer approach naturally fits the RSSM architecture already
+    described in Section 3.5. No changes to the world model architecture needed.
+
+  CONCRETE CODE CHANGE:
+    - At decision time (agent.act() in worldmodel/agent.py):
+        OLD (incorrect): simulate K action sequences, pick best
+        NEW (correct):   action = actor(encode(obs, h_prev))   [single forward pass]
+
+    - Training loop (Section 4.3) already correctly implements Dreamer.
+      The imagination loop in Section 4.3 runs DURING TRAINING, not at inference.
+      This is correct and does not need to change.
+
+    - Remove all references to "random shooting", "CEM", or "simulate action
+      sequences at each decision step" from this document and from code comments.
+
+    - Add explicit comment in worldmodel/agent.py:
+        # This agent uses the Dreamer paradigm (Hafner et al. 2019-2023).
+        # The world model is used ONLY during training to generate imagined
+        # rollouts for the actor-critic. At inference, only the actor is used.
+
+  Updated agent label: "Dreamer-style World Model" (not "World Model + Planning")
+  Primary citation: Hafner et al. 2019 "Dream to Control: Learning Behaviors
+    by Latent Imagination" (DreamerV1) — most accessible starting point.
+  Secondary citation: Hafner et al. 2023 "Mastering Diverse Domains through
+    World Models" (DreamerV3) — use its RSSM architecture as reference.
+
+  Optional extension (if time permits):
+    Implement a SECOND world model variant using random shooting (MPC) and
+    compare it against the Dreamer variant. This would add a 4th method to
+    the comparison and be a novel contribution. Label it "MPC World Model".
+    Only pursue this if all 3 primary agents are fully working and debugged.
+
+--------------------------------------------------------------------------------
+12.4 UPDATED METHOD LABELS (use these everywhere in code and report)
+--------------------------------------------------------------------------------
+
+  OLD LABEL             NEW LABEL                   CHANGE
+  -------------------------------------------------------------------
+  "PPO"                 "PPO (Model-Free)"           No change needed
+  "Dyna-Q"              "Neural Dyna-Q"              Add "Neural" everywhere
+  "World Model +        "Dreamer-style World Model"  Remove "Planning" reference;
+   Planning"             (Dreamer)                   clarify it's policy imagination
+
+  In all plots, CSVs, checkpoint filenames, config files:
+    ppo       -> ppo
+    dynaq     -> neural_dynaq   (rename all files and keys)
+    worldmodel -> dreamer       (rename all files and keys)
+
+  In the report:
+    Section 2 (Background) must clearly explain the tabular->neural Dyna-Q
+    transition and the planning->imagination World Model distinction.
+    These are the two conceptual contributions of the methodology section.
+
+--------------------------------------------------------------------------------
+12.5 PHASED IMPLEMENTATION ROADMAP
+--------------------------------------------------------------------------------
+
+Follow this sequence strictly. Do NOT jump to Phase 3 before Phase 1 is solid.
+Each phase has a clear "done" criterion before moving forward.
+
+PHASE 1 — Environment and PPO Baseline (Week 1)
+-----------------------------------------------
+Goal: Prove that your environment wrappers and training infrastructure are
+correct before adding any model-based complexity.
+
+Steps:
+  1a. Install all dependencies, verify imports.
+  1b. Implement make_env() with all wrappers (Section 2.3).
+      Verify: obs.shape == (3, 8, 8), dtype == float32, values in [0,1].
+  1c. Implement RecordEpisodeStatistics and CSV logger.
+  1d. Implement PPO using Stable-Baselines3 FIRST (not custom):
+        from stable_baselines3 import PPO
+        model = PPO("CnnPolicy", env, verbose=1)
+        model.learn(total_timesteps=200_000)
+      SB3 PPO is known-good. If it fails, the issue is in your env, not PPO.
+  1e. Verify SB3 PPO solves Empty-8x8 at >90% by 200K steps.
+      If it does NOT:
+        - Check reward signal (is it nonzero at goal?)
+        - Check done signal (is it True when goal reached?)
+        - Check obs normalization (are values in [0,1]?)
+        - Do NOT proceed to Phase 2 until this is fixed.
+  1f. Once SB3 PPO works, implement CUSTOM PPO (Section 4.1) and verify it
+      matches SB3 PPO performance within ±5% on Empty-8x8.
+      Custom PPO is needed for exact control over logging and checkpointing.
+
+DONE CRITERION FOR PHASE 1:
+  Custom PPO solves Empty-8x8 at ≥90% success by 200K steps.
+  CSV log file is populated with correct columns.
+  Checkpoint save/load works.
+
+PHASE 2 — Neural Dyna-Q (Week 2)
+----------------------------------
+Goal: Add a neural transition model on top of a working DQN baseline.
+Build incrementally — first DQN alone, then add the model.
+
+Steps:
+  2a. Implement DQN (no world model) using the Q-network from Section 3.3.
+      Verify DQN solves Empty-8x8 at >80% by 200K steps.
+      If DQN fails: check target network update frequency, epsilon decay,
+      replay buffer size (must be > 1000 before training starts).
+  2b. Implement TransitionModel (Section 3.4).
+      TEST THE MODEL IN ISOLATION first:
+        Collect 5000 real (s, a, s', r) transitions using random policy.
+        Train TransitionModel for 1000 gradient steps.
+        Plot: model prediction error vs training step (should decrease).
+        If error does not decrease: check learning rate, check that encoder
+        gradient is not flowing into model (use .detach() on z inputs).
+  2c. Add Dyna-Q planning loop (k=5) on top of working DQN.
+      Verify: success rate on Empty-8x8 improves faster than plain DQN.
+      If planning HURTS performance: model is too inaccurate early on.
+        Fix: add warmup period (no planning until model loss < threshold).
+        Fix: reduce k from 5 to 1 initially, increase after 20K steps.
+  2d. Run on DoorKey-8x8. Verify Neural Dyna-Q outperforms PPO in sample
+      efficiency (fewer steps to 50% success).
+
+DONE CRITERION FOR PHASE 2:
+  Neural Dyna-Q reaches 80% on Empty-8x8 with fewer steps than PPO.
+  Model loss decreases monotonically over first 10K steps.
+  k=5 planning is confirmed better than k=0 (DQN baseline) on DoorKey.
+
+PHASE 3 — Dreamer-style World Model (Weeks 3–4)
+-------------------------------------------------
+Goal: Implement the RSSM world model and latent actor-critic.
+This is the most complex component. Build and test each sub-module separately.
+
+Steps:
+  3a. Build and test RSSM in isolation:
+        Generate random MiniGrid trajectories (no training, just data collection).
+        Train RSSM on these fixed trajectories for 10K steps.
+        Visualize decoded observations at 0, 1K, 5K, 10K steps.
+        STOP if decoded obs look like random noise after 10K steps:
+          - Check KL loss is not dominating (reduce beta_kl to 0.1 initially)
+          - Check free_nats is set (prevents KL collapse)
+          - Check learning rate (6e-4 may be too high — try 1e-4)
+  3b. Train world model on PPO-generated data (NOT random data):
+        Run PPO for 50K steps on DoorKey, save replay buffer.
+        Train RSSM on this higher-quality data.
+        A world model trained on random walk data for DoorKey will never
+        see the goal room and will have near-zero reward prediction signal.
+        PPO data (even imperfect PPO) covers more of the state space.
+  3c. Add latent actor-critic on top of working world model:
+        Train actor-critic on imagined rollouts from RSSM.
+        Verify actor loss decreases (not oscillating or exploding).
+        Monitor: imagination horizon H=15 should produce non-trivial rewards.
+        If all imagined rewards = 0: world model hasn't learned reward dynamics.
+          Fix: reduce imagination horizon to H=5 initially.
+          Fix: oversample transitions with nonzero reward in RSSM training.
+  3d. Run full Dreamer agent on Empty-8x8. Verify >80% success by 50K steps.
+      If it fails to beat PPO's sample efficiency on Empty-8x8, there is a bug.
+      Dreamer should be the most sample-efficient on all envs.
+  3e. Run on DoorKey, MultiRoom, KeyCorridor.
+
+DONE CRITERION FOR PHASE 3:
+  Dreamer solves Empty-8x8 with fewer real env steps than PPO and Neural Dyna-Q.
+  Decoded observations are visually coherent (not noise) by 20K training steps.
+  Actor-critic loss is decreasing, not exploding or stuck at a constant.
+
+PHASE 4 — Full Experiments and Analysis (Week 4)
+-------------------------------------------------
+Steps:
+  4a. Run all 36 training runs via run_experiments.sh.
+  4b. Generate all 13 visualizations via visualize.py.
+  4c. Run ablations (planning ratio, imagination horizon).
+  4d. Run generalization tests.
+  4e. Compile results/tables/main_results.csv.
+
+DONE CRITERION FOR PHASE 4:
+  All 36 CSV log files populated, no NaN values.
+  All 13 PNG plots generated.
+  main_results.csv has 36 rows with all columns filled.
+
+PHASE 5 — Report and Writeup (Week 5)
+--------------------------------------
+Steps:
+  5a. Write report following Section 11 outline.
+  5b. All figures in report reference exact filenames from results/plots/.
+  5c. Results section reports mean ± std across 3 seeds.
+  5d. Discussion explicitly addresses the two architectural issues in this section
+      (tabular->neural Dyna-Q and planning->imagination World Model).
+
+--------------------------------------------------------------------------------
+12.6 COMMON FAILURE MODES AND FIXES (pre-emptive debugging guide)
+--------------------------------------------------------------------------------
+
+SYMPTOM: PPO success rate stays at 0 for 100K steps on Empty-8x8.
+  CAUSE:   Reward signal is broken. Agent is not receiving +1 at goal.
+  FIX:     Print reward at every step for first 20 steps. Manually step agent
+           toward goal in a test script and confirm reward is nonzero on arrival.
+
+SYMPTOM: PPO entropy collapses to near-0 in first 10K steps.
+  CAUSE:   Entropy coefficient too low, or learning rate too high.
+  FIX:     Increase entropy_coef from 0.01 to 0.05. Reduce lr from 3e-4 to 1e-4.
+
+SYMPTOM: Neural Dyna-Q diverges (Q-values -> inf or NaN).
+  CAUSE:   Missing target network, missing gradient clipping, or lr too high.
+  FIX:     Verify target_net is updated (not trained). Add gradient norm logging.
+           Use Huber loss (smooth_l1) instead of MSE for Q-update.
+
+SYMPTOM: Transition model loss plateaus immediately and does not decrease.
+  CAUSE:   Encoder gradients are flowing into model inputs incorrectly.
+  FIX:     Ensure z = encoder(obs).detach() when computing model loss inputs.
+           The encoder should be trained only by Q-network loss, not model loss.
+
+SYMPTOM: RSSM decoded observations look like uniform gray after 10K steps.
+  CAUSE:   KL collapse — posterior collapses to prior, z carries no information.
+  FIX:     Reduce beta_kl to 0.1. Set free_nats=1.0. Check that posterior
+           MLP is receiving gradient (add gradient hook to verify).
+
+SYMPTOM: World model imagined rewards are all near-zero during imagination.
+  CAUSE:   Model trained on mostly-zero-reward data (sparse reward problem).
+  FIX:     Oversample reward-nonzero transitions: when storing sequences,
+           give 10x weight to sequences containing at least one nonzero reward.
+           Or: use hindsight reward relabeling (treat reaching any new state
+           as a small reward during world model training only).
+
+SYMPTOM: Dreamer actor loss oscillates without decreasing.
+  CAUSE:   Imagination horizon too long, gradients exploding through time.
+  FIX:     Reduce H from 15 to 5. Add gradient clipping (max_norm=100).
+           Use straight-through gradients for discrete actions if applicable.
+
+SYMPTOM: Generalization success on 16x16 is 0 for all agents.
+  CAUSE:   Observation shape mismatch — 16x16 env produces (3,16,16) obs
+           but encoder expects (3,8,8).
+  FIX:     Add adaptive pooling layer at encoder input:
+             nn.AdaptiveAvgPool2d((8, 8))
+           This resizes any obs to 8x8 before the CNN.
+           Alternatively: train with random obs cropping as data augmentation.
+
+SYMPTOM: All 3 agents perform identically on Empty-8x8.
+  CAUSE:   Task too easy — all agents saturate at 100%. This is expected.
+  FIX:     Do not draw conclusions from Empty-8x8. It is a sanity check only.
+           All interesting comparisons happen on DoorKey, MultiRoom, KeyCorridor.
+
+================================================================================
+END OF PLAN — Pranav Manimaran & Vandana Mansur — EEC 289A Spring 2026
+================================================================================
