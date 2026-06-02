@@ -1,0 +1,50 @@
+EEC 289A — Benchmark Run Notes
+Pranav Manimaran, Vandana Mansur
+Spring 2026
+
+================================================================================
+FIRST RUN (benchmark_colab.ipynb — Try 1)
+================================================================================
+
+The first full benchmark run completed 27 of 36 training runs. All 9 keycorridor
+runs failed due to an incorrect environment ID in ENV_MAP:
+
+    Incorrect: "MiniGrid-KeyCorridor-S3-R1-v0"  (dashes in S/R suffix)
+    Correct:   "MiniGrid-KeyCorridorS3R1-v0"
+
+The MiniGrid 2.3.1 library uses a compact naming convention without dashes in the
+S/R suffix for KeyCorridor environments. The wrong ID caused a NameNotFound error
+at the start of each keycorridor training run. Because the notebook wraps each run
+in a try/except block, the errors were caught silently and training continued for
+all other environments. The final output was 27/36 runs across empty, doorkey, and
+multiroom for all three agents (PPO, Neural Dyna-Q, Dreamer) and all three seeds
+(42, 123, 777).
+
+================================================================================
+SECOND RUN (benchmark_colab.ipynb — current)
+================================================================================
+
+The environment ID was corrected in ENV_MAP. Two additional incorrect IDs in
+GEN_ENV_MAP (used for zero-shot generalization eval) were also fixed:
+
+    multiroom gen env:   "MiniGrid-MultiRoom-N4-S8-v0"  → "MiniGrid-MultiRoom-N6-v0"
+    keycorridor gen env: "MiniGrid-KeyCorridor-S4-R2-v0" → "MiniGrid-KeyCorridorS4R3-v0"
+
+The second run targets the 9 missing keycorridor runs, plus the ablation sweeps
+(Dyna-Q planning ratio k and Dreamer imagination horizon H) and generalization eval
+that were not completed in the first run.
+
+================================================================================
+COMPUTE SAVINGS — HOW WE AVOIDED RE-RUNNING 27 COMPLETED RUNS
+================================================================================
+
+The notebook's full-run cell includes skip logic:
+
+    if os.path.exists(log_path) and os.path.getsize(log_path) > 200:
+        print(f"[SKIP] {run_id} — log exists")
+
+If a training log CSV already exists and is non-empty, that run is skipped
+entirely. The 27 completed CSVs from the first run were transferred to the second
+Colab session by uploading the results zip to Google Drive and extracting it before
+running the training cell. As a result, only the 9 keycorridor runs were trained
+from scratch in the second session, saving approximately 5-6 hours of GPU compute.

@@ -1,133 +1,176 @@
 # Sample Efficiency in Sparse-Reward Navigation: Model-Free vs. Model-Based RL
 
-**Pranav Manimaran, Vandana Mansur**
+**Pranav Manimaran, Vandana Mansur**  
 EEC 289A — Sensorimotor Learning, UC Davis, Spring 2026
+
+---
 
 ## Overview
 
-This project benchmarks three reinforcement learning agents — PPO (model-free), Neural Dyna-Q (classical model-based), and Dreamer (world-model-based) — on four MiniGrid sparse-reward navigation environments. We measure sample efficiency (steps to 50%/80% success), wall-clock training time, and zero-shot generalization to larger (16×16) grid variants.
+This project benchmarks three reinforcement learning agents — **PPO** (model-free), **Neural Dyna-Q** (classical model-based), and **Dreamer** (world-model-based) — on four MiniGrid sparse-reward navigation environments. We measure sample efficiency (steps to 50%/80% success), wall-clock training time, and zero-shot generalization to larger (16×16) grid variants.
+
+---
+
+## Repository Structure
+
+```
+EEC-289A-Final-Project/
+├── src/
+│   ├── benchmark.py          # All three agents + training/eval/logging
+│   ├── visualize.py          # Plot generation (all figures)
+│   └── local_test.py         # Smoke test (~2 min on CPU)
+│
+├── notebooks/
+│   ├── benchmark_colab.ipynb       # Google Colab (single GPU)
+│   ├── benchmark_kaggle.ipynb      # Kaggle (CPU)
+│   └── benchmark_kaggle_gpu.ipynb  # Kaggle (dual T4, parallel runs)
+│
+├── scripts/
+│   └── run_experiments.sh    # Full 36-run + ablation launcher (local)
+│
+├── results/
+│   ├── logs/                 # Per-run training CSVs
+│   ├── plots/                # Generated figures (PNG)
+│   └── tables/               # summary_table.csv, generalization_results.csv
+│
+├── reports/
+│   ├── proposal.md                         # Project proposal
+│   ├── plan.txt                            # Detailed experiment plan
+│   ├── report_plan.md                      # Final report outline
+│   ├── ppt_plan.md                         # Presentation outline
+│   ├── run_notes.txt                       # Kaggle run notes & bug log
+│   ├── initial_idea.txt                    # Initial brainstorm
+│   └── SensorimotorLearning-Proposal.pdf   # Submitted proposal PDF
+│
+├── requirements.txt
+└── README.md
+```
+
+---
 
 ## Environments
 
 | Key | Environment ID | Challenge |
-|-----|---------------|-----------|
-| `empty` | `MiniGrid-Empty-8x8-v0` | Sanity check — all agents should solve this |
-| `doorkey` | `MiniGrid-DoorKey-8x8-v0` | Two-stage: pick up key, unlock door, reach goal |
-| `multiroom` | `MiniGrid-MultiRoom-N4-S5-v0` | Traverse 4 connected rooms — long credit assignment |
-| `keycorridor` | `MiniGrid-KeyCorridor-S3-R1-v0` | Longest horizon, multiple locked doors |
+|-----|----------------|-----------|
+| `empty` | `MiniGrid-Empty-8x8-v0` | Sanity check — navigate to goal |
+| `doorkey` | `MiniGrid-DoorKey-8x8-v0` | Pick up key, unlock door, reach goal |
+| `multiroom` | `MiniGrid-MultiRoom-N4-S5-v0` | Traverse 4 rooms — long credit assignment |
+| `keycorridor` | `MiniGrid-KeyCorridorS3R1-v0` | Longest horizon, multiple locked doors |
 
-All environments use sparse reward (+1 at goal only, 0 otherwise) and full observability.
+All environments use **sparse reward** (+1 at goal only) and **full observability**.
+
+Zero-shot generalization is evaluated on larger 16×16 variants after training.
+
+---
 
 ## Agents
 
-| Agent | Description | Training Steps |
-|-------|-------------|----------------|
-| **PPO** | Clipped surrogate objective, GAE(λ=0.95), shared CNN encoder | 500K |
-| **Neural Dyna-Q** | DQN + neural transition model, planning ratio k=5 (real + imagined Q-updates) | 500K |
-| **Dreamer** | RSSM world model (GRU h=512, latent z=32), latent actor-critic, imagination horizon H=15 | 200K |
+| Agent | Description | Steps |
+|-------|-------------|-------|
+| **PPO** | Clipped surrogate, GAE(λ=0.95), shared CNN encoder | 500K |
+| **Neural Dyna-Q** | Double DQN + neural transition model, planning ratio k=5 | 500K |
+| **Dreamer** | RSSM world model (GRU h=512, z=32), latent actor-critic, horizon H=15 | 200K |
 
-Each agent is evaluated with 3 seeds (42, 123, 777) across all 4 environments = 36 main training runs.
+**Experimental design:** 3 agents × 4 environments × 3 seeds (42, 123, 777) = **36 main runs**.
+
+---
 
 ## Installation
 
 ```bash
-pip install minigrid==2.3.1 gymnasium==0.29.1 torch torchvision \
-    numpy matplotlib seaborn pandas scipy tqdm
+pip install -r requirements.txt
 ```
 
-Python 3.10+ required.
+Python 3.10+ required. For GPU training, install the CUDA-enabled PyTorch wheel from [pytorch.org](https://pytorch.org/get-started/locally/).
 
-## Quick Start — Smoke Test
+---
 
-Verifies all three agents train and log correctly. Runs ~15 minutes on a GPU (T4 or better).
+## Quick Start
+
+### Smoke test (~2 min on CPU)
+
+Runs all three agents for 1K steps on Empty-8x8, verifies CSV logging and checkpointing:
 
 ```bash
+cd src
 python local_test.py
 ```
 
-All three agents should print `[PASS]`. Output CSVs are written to `results_local_test/logs/` and cleaned up automatically.
+All three agents should print `[PASS]`.
 
-## Single Training Run
+### Single training run
 
 ```bash
+cd src
 python benchmark.py \
     --agent ppo \
     --env doorkey \
     --seed 42 \
     --total_steps 500000 \
-    --save_dir results \
+    --save_dir ../results \
     --eval_generalization
 ```
 
-**All flags:**
+**CLI flags:**
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
 | `--agent` | `ppo`, `dynaq`, `dreamer` | required | Agent to train |
 | `--env` | `empty`, `doorkey`, `multiroom`, `keycorridor` | required | Environment |
 | `--seed` | int | required | Random seed |
-| `--total_steps` | int | required | Environment steps to train for |
-| `--save_dir` | path | required | Directory for logs, checkpoints, tables |
-| `--planning_k` | int | 5 | Dyna-Q only: planning steps per real step |
-| `--imagination_h` | int | 15 | Dreamer only: imagination rollout horizon |
-| `--eval_generalization` | flag | off | After training, zero-shot eval on 16×16 variant |
+| `--total_steps` | int | required | Environment steps |
+| `--save_dir` | path | `results` | Output directory |
+| `--planning_k` | int | 5 | Dyna-Q: imagined updates per real step |
+| `--imagination_h` | int | 15 | Dreamer: imagination rollout horizon |
+| `--eval_generalization` | flag | off | Zero-shot eval on 16×16 variant after training |
 
-Logs are written to `{save_dir}/logs/`, checkpoints to `{save_dir}/checkpoints/`.
+Logs → `{save_dir}/logs/`, checkpoints → `{save_dir}/checkpoints/`.
 
-## Full Benchmark (36 runs + ablations + visualizations)
+### Full benchmark (36 runs + ablations + figures)
 
 ```bash
-bash run_experiments.sh
+bash scripts/run_experiments.sh
 ```
 
-Estimated time: **12–24 hours on a T4 GPU** (Colab or equivalent). The script runs:
+Estimated: **12–24 hours on a T4 GPU**. Runs all training phases, ablation sweeps, and generates all figures.
 
-1. **Phase 1** — 36 main training runs (4 envs × 3 seeds × 3 agents) with generalization eval
-2. **Phase 2** — Dyna-Q planning ratio ablation: k ∈ {0, 1, 10, 20} on DoorKey, seed 42
-3. **Phase 3** — Dreamer horizon ablation: H ∈ {5, 10, 20, 25} on MultiRoom, seed 42
-4. **Phase 4** — All visualizations via `visualize.py`
+---
 
-## Visualizations
+## Notebooks
+
+All notebooks share the same codebase as `src/benchmark.py` and include a `SMOKE_TEST` flag in the config cell:
+
+| Notebook | Platform | Parallelism |
+|----------|----------|-------------|
+| `benchmark_colab.ipynb` | Google Colab | Sequential, single GPU |
+| `benchmark_kaggle.ipynb` | Kaggle | Sequential, CPU |
+| `benchmark_kaggle_gpu.ipynb` | Kaggle | Parallel across dual T4 GPUs |
+
+Set `SMOKE_TEST = True` to run a quick sanity check (~15 min on T4); `False` for the full benchmark.
+
+---
+
+## Visualization
 
 ```bash
-python visualize.py --results_dir results/
+cd src
+python visualize.py --results_dir ../results
 ```
 
 Figures are saved to `results/plots/`:
 
 | File | Description |
 |------|-------------|
-| `learning_curves_all.png` | Success rate vs. steps, all envs (2×2 grid, mean ± std) |
-| `learning_curves_{env}.png` | Per-environment learning curves |
+| `fig1_learning_curves_2x2.png` | Success rate vs. steps, all envs (mean ± std) |
 | `sample_efficiency_50pct.png` | Steps to 50% success, grouped bar chart |
 | `sample_efficiency_80pct.png` | Steps to 80% success, grouped bar chart |
 | `wallclock.png` | Wall-clock minutes to 80% success |
-| `generalization_heatmap.png` | Zero-shot success on 16×16 (requires `--eval_generalization`) |
-| `ablation_planning_ratio.png` | Dyna-Q k sweep (requires ablation runs) |
-| `ablation_horizon.png` | Dreamer H sweep (requires ablation runs) |
-| `loss_curves_{ppo,dynaq,dreamer}.png` | Per-agent loss diagnostics |
-| `per_seed_variance.png` | Individual seed runs vs. mean on Empty-8x8 |
+| `loss_curves_{agent}.png` | Per-agent loss diagnostics |
+| `per_seed_variance.png` | Individual seed runs vs. mean on Empty-8×8 |
 | `grad_norm_diagnostics.png` | Gradient norm EMA over training |
+| `episode_length_curves.png` | Mean episode length over training |
 
-Run with `--figures 1,2,3` to generate only specific figures.
-
-## Results Directory Structure
-
-```
-results/
-  logs/                          # Per-run training logs (CSV)
-    {agent}_{env}_seed{N}.csv
-  checkpoints/                   # Saved model weights
-    {agent}_{env}_seed{N}_step{K}.pt
-  plots/                         # All generated figures (PNG)
-  tables/
-    summary_table.csv            # Aggregated metrics (12 rows, one per agent×env)
-    generalization_results.csv   # Zero-shot 16×16 success rates
-  ablation_k/                    # Dyna-Q planning ratio sweep
-    logs/  checkpoints/
-  ablation_h/                    # Dreamer horizon sweep
-    logs/  checkpoints/
-```
+---
 
 ## CSV Log Columns
 
@@ -139,26 +182,11 @@ results/
 | `mean_return` | ✓ | ✓ | ✓ |
 | `wall_time_sec` | ✓ | ✓ | ✓ |
 | `grad_norm` | ✓ | ✓ | ✓ |
-| `policy_loss` | ✓ | — | — |
-| `value_loss` | ✓ | — | — |
-| `entropy` | ✓ | — | — |
-| `q_loss` | — | ✓ | — |
-| `model_loss` | — | ✓ | — |
-| `epsilon` | — | ✓ | — |
-| `wm_loss` | — | — | ✓ |
-| `actor_loss` | — | — | ✓ |
-| `critic_loss` | — | — | ✓ |
-| `recon_loss` | — | — | ✓ |
-| `kl_loss` | — | — | ✓ |
+| `policy_loss` / `value_loss` / `entropy` | ✓ | — | — |
+| `q_loss` / `model_loss` / `epsilon` | — | ✓ | — |
+| `wm_loss` / `actor_loss` / `critic_loss` / `recon_loss` / `kl_loss` | — | — | ✓ |
 
-## Colab Notebook
-
-`benchmark_colab.ipynb` is a self-contained Colab notebook with all training and visualization code.
-
-- **§8 config cell** contains `SMOKE_TEST = True/False` — the single place to switch modes
-  - `True`: trains on Empty-8x8 only for 25K/25K/15K steps (~15 min on T4, verifies setup)
-  - `False`: full 36-run benchmark (~3–6 hours on T4)
-- Figures generated in the notebook match `visualize.py` output exactly
+---
 
 ## Key Hyperparameters
 
@@ -166,15 +194,20 @@ results/
 |-----------|-------|
 | Seeds | 42, 123, 777 |
 | CNN encoder output dim | 256 |
-| RSSM GRU hidden dim | 512 |
-| RSSM latent z dim | 32 |
-| PPO learning rate | 3e-4 |
-| PPO clip epsilon | 0.2 |
-| Dyna-Q Q-net learning rate | 1e-4 |
-| Dyna-Q model learning rate | 1e-3 |
+| RSSM GRU hidden dim (h) | 512 |
+| RSSM latent dim (z) | 32 |
+| PPO learning rate | 3×10⁻⁴ |
+| PPO clip ε | 0.2 |
+| Dyna-Q Q-net / model learning rate | 1×10⁻⁴ / 1×10⁻³ |
 | Dyna-Q planning ratio k | 5 |
-| Dreamer world model learning rate | 6e-4 |
-| Dreamer actor/critic learning rate | 8e-5 |
+| Dreamer world-model / actor-critic lr | 6×10⁻⁴ / 8×10⁻⁵ |
 | Dreamer imagination horizon H | 15 |
 | Discount γ | 0.99 |
 | GAE / lambda-return λ | 0.95 |
+
+---
+
+## Authors
+
+- **Pranav Manimaran** — [pranavnm09123@gmail.com](mailto:pranavnm09123@gmail.com)
+- **Vandana Mansur** — [vandanacmansur@gmail.com](mailto:vandanacmansur@gmail.com)

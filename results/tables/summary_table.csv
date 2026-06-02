@@ -1,0 +1,13 @@
+agent,env,final_sr_mean,final_sr_std,steps_to_50K,steps_to_80K,wallclock_80_min,gen_rate_16x16
+ppo,empty,1.0,0.0,22.5,22.5,0.5,
+ppo,doorkey,,,,,,
+ppo,multiroom,,,,,,
+ppo,keycorridor,,,,,,
+dynaq,empty,0.0,0.0,,,,
+dynaq,doorkey,,,,,,
+dynaq,multiroom,,,,,,
+dynaq,keycorridor,,,,,,
+dreamer,empty,0.1,0.0,,,,
+dreamer,doorkey,,,,,,
+dreamer,multiroom,,,,,,
+dreamer,keycorridor,,,,,,
